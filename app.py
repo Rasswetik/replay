@@ -636,6 +636,57 @@ def disconnect():
     return jsonify({'success': True})
 
 
+@app.route('/get-star-gifts', methods=['POST'])
+def get_star_gifts():
+    """Fetch available star gifts from Telegram catalog."""
+    if not _check_secret():
+        return jsonify({'error': 'Unauthorized'}), 403
+
+    data = _load_session()
+    if not data.get('session'):
+        return jsonify({'ok': False, 'error': 'Сессия не настроена'}), 400
+
+    async def _fetch():
+        client = _make_client()
+        if not client:
+            return None, 'Клиент не создан'
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                return None, 'Сессия истекла'
+
+            result = await client(tl_functions.payments.GetStarGiftsRequest(hash=0))
+            gifts = []
+            gift_list = getattr(result, 'gifts', [])
+            for g in gift_list:
+                gifts.append({
+                    'id': g.id,
+                    'stars': g.stars,
+                    'convert_stars': getattr(g, 'convert_stars', 0),
+                    'limited': getattr(g, 'limited', False),
+                    'sold_out': getattr(g, 'sold_out', False),
+                    'availability_remains': getattr(g, 'availability_remains', None),
+                    'availability_total': getattr(g, 'availability_total', None),
+                    'title': getattr(g, 'title', ''),
+                })
+            await client.disconnect()
+            return gifts, ''
+        except Exception as e:
+            try:
+                await client.disconnect()
+            except:
+                pass
+            return None, str(e)
+
+    try:
+        gifts, err = _run_async(_fetch())
+        if err:
+            return jsonify({'ok': False, 'error': err}), 400
+        return jsonify({'ok': True, 'gifts': gifts})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+
+
 @app.route('/send-gift', methods=['POST'])
 def send_gift():
     if not _check_secret():
@@ -662,6 +713,7 @@ def send_gift():
                 return False, 'Сессия истекла, переавторизуйтесь'
 
             target = await client.get_input_entity(int(user_id))
+            logging.info(f"Sending star gift {gift_id} to user {user_id}, peer={target}")
 
             invoice = tl_types.InputInvoiceStarGift(
                 peer=target,
@@ -671,11 +723,13 @@ def send_gift():
             form = await client(tl_functions.payments.GetPaymentFormRequest(
                 invoice=invoice,
             ))
+            logging.info(f"Got payment form: form_id={form.form_id}")
 
-            await client(tl_functions.payments.SendStarsFormRequest(
+            result = await client(tl_functions.payments.SendStarsFormRequest(
                 form_id=form.form_id,
                 invoice=invoice,
             ))
+            logging.info(f"SendStarsForm result: {result}")
 
             await client.disconnect()
             return True, ''
@@ -684,6 +738,7 @@ def send_gift():
                 await client.disconnect()
             except:
                 pass
+            logging.error(f"send_gift exception: {type(e).__name__}: {e}")
             return False, str(e)
 
     try:
