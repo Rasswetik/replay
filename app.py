@@ -128,17 +128,31 @@ def status():
             'phone': phone,
         })
 
-    # Check if session is valid
+    # Check if session is valid + get balance
     async def _check():
         client = _make_client()
         if not client:
-            return False, None
+            return False, None, None
         try:
             await client.connect()
             if await client.is_user_authorized():
                 me = await client.get_me()
+                # Get star balance
+                balance = None
+                try:
+                    stars_status = await client(tl_functions.payments.GetStarsStatusRequest(
+                        peer=tl_types.InputPeerSelf()
+                    ))
+                    if hasattr(stars_status, 'balance'):
+                        b = stars_status.balance
+                        if hasattr(b, 'amount'):
+                            balance = b.amount + (b.nanos / 1e9 if b.nanos else 0)
+                        else:
+                            balance = int(b)
+                except Exception as e:
+                    logging.warning(f"Balance check error: {e}")
                 await client.disconnect()
-                return True, me
+                return True, me, balance
             await client.disconnect()
         except Exception as e:
             logging.warning(f"Session check error: {e}")
@@ -146,9 +160,9 @@ def status():
                 await client.disconnect()
             except:
                 pass
-        return False, None
+        return False, None, None
 
-    connected, me = _run_async(_check())
+    connected, me, balance = _run_async(_check())
     result = {
         'connected': connected,
         'api_id': api_id,
@@ -160,6 +174,8 @@ def status():
         result['account_name'] = name.strip()
         result['account_id'] = me.id
         result['username'] = me.username or ''
+        if balance is not None:
+            result['star_balance'] = balance
     return jsonify(result)
 
 
