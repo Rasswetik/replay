@@ -1,0 +1,16 @@
+render.yaml — Render.com Blueprint
+# Deploy: Connect GitHub repo → this file auto-configures the service
+
+services:
+  - type: web
+    name: lunagifts-relay
+    runtime: python
+    plan: free
+    rootDir: telethon_relay
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: RELAY_SECRET
+        generateValue: true
+      - key: PYTHON_VERSION
+        value: "3.12.0"
