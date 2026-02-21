@@ -654,13 +654,15 @@ def disconnect():
 
 @app.route('/get-star-gifts', methods=['POST'])
 def get_star_gifts():
-    """Fetch available star gifts from Telegram catalog."""
+    """Fetch available star gifts from Telegram catalog with sticker thumbnails."""
     if not _check_secret():
         return jsonify({'error': 'Unauthorized'}), 403
 
     data = _load_session()
     if not data.get('session'):
         return jsonify({'ok': False, 'error': 'Сессия не настроена'}), 400
+
+    include_thumbs = (request.json or {}).get('include_thumbs', False)
 
     async def _fetch():
         client = _make_client()
@@ -671,11 +673,26 @@ def get_star_gifts():
             if not await client.is_user_authorized():
                 return None, 'Сессия истекла'
 
+            # Also fetch balance
+            balance = None
+            try:
+                stars_status = await client(tl_functions.payments.GetStarsStatusRequest(
+                    peer=tl_types.InputPeerSelf()
+                ))
+                if hasattr(stars_status, 'balance'):
+                    b = stars_status.balance
+                    if hasattr(b, 'amount'):
+                        balance = b.amount + (b.nanos / 1e9 if b.nanos else 0)
+                    else:
+                        balance = int(b)
+            except Exception as be:
+                logging.warning(f"Balance check in catalog: {be}")
+
             result = await client(tl_functions.payments.GetStarGiftsRequest(hash=0))
             gifts = []
             gift_list = getattr(result, 'gifts', [])
             for g in gift_list:
-                gifts.append({
+                gift_data = {
                     'id': g.id,
                     'stars': g.stars,
                     'convert_stars': getattr(g, 'convert_stars', 0),
@@ -684,21 +701,37 @@ def get_star_gifts():
                     'availability_remains': getattr(g, 'availability_remains', None),
                     'availability_total': getattr(g, 'availability_total', None),
                     'title': getattr(g, 'title', ''),
-                })
+                }
+                # Try to get sticker thumbnail as base64
+                if include_thumbs:
+                    sticker = getattr(g, 'sticker', None)
+                    if sticker:
+                        try:
+                            thumb_bytes = await client.download_media(sticker, bytes, thumb=0)
+                            if thumb_bytes:
+                                gift_data['thumb_b64'] = base64.b64encode(thumb_bytes).decode('ascii')
+                                gift_data['thumb_mime'] = 'image/webp'
+                        except Exception as te:
+                            logging.debug(f"Thumb download failed for gift {g.id}: {te}")
+                gifts.append(gift_data)
             await client.disconnect()
-            return gifts, ''
+            return gifts, balance, ''
         except Exception as e:
             try:
                 await client.disconnect()
             except:
                 pass
-            return None, str(e)
+            return None, None, str(e)
 
     try:
-        gifts, err = _run_async(_fetch())
+        result = _run_async(_fetch())
+        gifts, balance, err = result
         if err:
             return jsonify({'ok': False, 'error': err}), 400
-        return jsonify({'ok': True, 'gifts': gifts})
+        resp = {'ok': True, 'gifts': gifts}
+        if balance is not None:
+            resp['star_balance'] = balance
+        return jsonify(resp)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 400
 
@@ -747,6 +780,23 @@ def send_gift():
 
             target = await client.get_input_entity(int(user_id))
             logging.info(f"Sending star gift {gift_id} to user {user_id}, peer={target}")
+
+            # Validate gift exists in current catalog
+            try:
+                catalog = await client(tl_functions.payments.GetStarGiftsRequest(hash=0))
+                gift_list = getattr(catalog, 'gifts', [])
+                valid_ids = {g.id for g in gift_list}
+                gid = int(gift_id)
+                if gid not in valid_ids:
+                    # Try to find closest match by star price
+                    avail = [{'id': g.id, 'stars': g.stars, 'title': getattr(g, 'title', ''), 'sold_out': getattr(g, 'sold_out', False)} for g in gift_list if not getattr(g, 'sold_out', False)]
+                    avail_str = ', '.join(f"{a['id']}({a['stars']}⭐)" for a in avail[:20])
+                    logging.error(f"Gift {gift_id} not found in catalog. Available: {avail_str}")
+                    await client.disconnect()
+                    return False, f'STARGIFT_INVALID: подарок {gift_id} не найден в каталоге Telegram. Доступные ID: {avail_str}'
+                logging.info(f"Gift {gift_id} found in catalog, proceeding to send")
+            except Exception as ce:
+                logging.warning(f"Catalog validation failed (proceeding anyway): {ce}")
 
             invoice = tl_types.InputInvoiceStarGift(
                 peer=target,
