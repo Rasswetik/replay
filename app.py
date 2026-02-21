@@ -728,6 +728,23 @@ def send_gift():
             if not await client.is_user_authorized():
                 return False, 'Сессия истекла, переавторизуйтесь'
 
+            # Check star balance before sending
+            try:
+                stars_status = await client(tl_functions.payments.GetStarsStatusRequest(
+                    peer=tl_types.InputPeerSelf()
+                ))
+                balance = 0
+                if hasattr(stars_status, 'balance'):
+                    b = stars_status.balance
+                    if hasattr(b, 'amount'):
+                        balance = b.amount
+                    else:
+                        balance = int(b)
+                logging.info(f"Account star balance: {balance}")
+            except Exception as be:
+                logging.warning(f"Balance check failed: {be}")
+                balance = None
+
             target = await client.get_input_entity(int(user_id))
             logging.info(f"Sending star gift {gift_id} to user {user_id}, peer={target}")
 
