@@ -8,12 +8,15 @@ import os
 import json
 import asyncio
 import logging
+import base64
 from flask import Flask, request, jsonify
 
 # ---------- Telethon ----------
 from telethon import TelegramClient, errors as tl_errors
 from telethon.sessions import StringSession
 from telethon.tl import functions as tl_functions, types as tl_types
+from telethon.tl.functions.auth import ExportLoginTokenRequest, ImportLoginTokenRequest
+from telethon.tl.types.auth import LoginToken, LoginTokenMigrateTo, LoginTokenSuccess
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -81,6 +84,22 @@ def _make_client(session_str='', api_id=None, api_hash=None):
         system_version='1.0',
         app_version='1.0',
     )
+
+
+def _code_type_name(sent_type):
+    """Convert Telegram SentCode type to human-readable name."""
+    name = type(sent_type).__name__
+    mapping = {
+        'SentCodeTypeApp': 'Telegram (в приложении)',
+        'SentCodeTypeSms': 'SMS',
+        'SentCodeTypeCall': 'Звонок',
+        'SentCodeTypeFlashCall': 'Flash-звонок',
+        'SentCodeTypeMissedCall': 'Пропущенный звонок',
+        'SentCodeTypeFragmentSms': 'Fragment SMS',
+        'SentCodeTypeEmailCode': 'Email',
+        'SentCodeTypeFirebaseSms': 'Firebase SMS',
+    }
+    return mapping.get(name, name)
 
 
 # ---------- API Endpoints ----------
@@ -169,21 +188,47 @@ def send_code():
     data['phone'] = phone
     _save_session(data)
 
+    # force_sms=True → resend as SMS if previous code was in-app
+    force_sms = body.get('force_sms', False)
+
     async def _send():
         client = _make_client('', api_id_int, api_hash)
         await client.connect()
+
+        if force_sms:
+            # Try to resend code via SMS
+            old_data = _load_session()
+            old_hash = old_data.get('phone_code_hash', '')
+            old_session = old_data.get('temp_session', '')
+            if old_hash and old_session:
+                # Reconnect with the temp session that started auth
+                client2 = TelegramClient(StringSession(old_session), api_id_int, api_hash)
+                await client2.connect()
+                try:
+                    from telethon.tl.functions.auth import ResendCodeRequest
+                    result = await client2(ResendCodeRequest(phone, old_hash))
+                    ts = client2.session.save()
+                    await client2.disconnect()
+                    await client.disconnect()
+                    return result.phone_code_hash, ts, _code_type_name(result.type)
+                except Exception as e:
+                    logging.warning(f"ResendCode failed: {e}, falling back to new send_code")
+                    await client2.disconnect()
+
         result = await client.send_code_request(phone)
         temp_session = client.session.save()
         await client.disconnect()
-        return result.phone_code_hash, temp_session
+        return result.phone_code_hash, temp_session, _code_type_name(result.type)
 
     try:
-        pch, temp_session = _run_async(_send())
+        pch, temp_session, code_type = _run_async(_send())
         data = _load_session()
         data['phone_code_hash'] = pch
         data['temp_session'] = temp_session
         _save_session(data)
-        return jsonify({'success': True, 'message': 'Код отправлен в Telegram'})
+        logging.info(f"Code sent via: {code_type}, phone_code_hash: {pch[:8]}...")
+        msg = f'Код отправлен через {code_type}'
+        return jsonify({'success': True, 'message': msg, 'code_type': code_type})
     except Exception as e:
         err = str(e)
         logging.error(f"send_code error: {err}")
@@ -266,6 +311,307 @@ def sign_in():
         data['session'] = result['session']
         data.pop('temp_session', None)
         data.pop('phone_code_hash', None)
+        _save_session(data)
+        return jsonify({
+            'success': True,
+            'account_name': result['name'],
+            'account_id': result['user_id'],
+            'username': result['username'],
+        })
+
+    return jsonify({'error': 'Неизвестная ошибка'}), 400
+
+
+@app.route('/import-session', methods=['POST'])
+def import_session():
+    """Import a pre-generated StringSession (bypasses send-code/sign-in)."""
+    if not _check_secret():
+        return jsonify({'error': 'Unauthorized'}), 403
+
+    body = request.json or {}
+    session_str = str(body.get('session_string', '')).strip()
+    api_id = str(body.get('api_id', '')).strip()
+    api_hash = str(body.get('api_hash', '')).strip()
+
+    if not session_str:
+        return jsonify({'error': 'session_string обязателен'}), 400
+    if not api_id or not api_hash:
+        return jsonify({'error': 'api_id и api_hash обязательны'}), 400
+
+    try:
+        api_id_int = int(api_id)
+    except ValueError:
+        return jsonify({'error': 'API ID должен быть числом'}), 400
+
+    # Validate the session by connecting
+    async def _validate():
+        client = TelegramClient(StringSession(session_str), api_id_int, api_hash)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                return None, 'Сессия невалидна или истекла'
+            me = await client.get_me()
+            saved = client.session.save()
+            await client.disconnect()
+            name = (me.first_name or '') + (' ' + me.last_name if me.last_name else '')
+            return {
+                'success': True,
+                'session': saved,
+                'name': name.strip(),
+                'user_id': me.id,
+                'username': me.username or '',
+                'phone': me.phone or '',
+            }, None
+        except Exception as e:
+            try:
+                await client.disconnect()
+            except:
+                pass
+            return None, str(e)
+
+    try:
+        result, err = _run_async(_validate())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+    if err:
+        return jsonify({'error': err}), 400
+
+    # Save session
+    data = _load_session()
+    data['session'] = result['session']
+    data['api_id'] = api_id
+    data['api_hash'] = api_hash
+    data['phone'] = result.get('phone', '')
+    data.pop('temp_session', None)
+    data.pop('phone_code_hash', None)
+    _save_session(data)
+
+    return jsonify({
+        'success': True,
+        'account_name': result['name'],
+        'account_id': result['user_id'],
+        'username': result['username'],
+    })
+
+
+# ---------- QR Login ----------
+
+@app.route('/qr-login/start', methods=['POST'])
+def qr_login_start():
+    """Generate QR login token."""
+    if not _check_secret():
+        return jsonify({'error': 'Unauthorized'}), 403
+
+    body = request.json or {}
+    api_id = str(body.get('api_id', '')).strip()
+    api_hash = str(body.get('api_hash', '')).strip()
+
+    if not api_id or not api_hash:
+        return jsonify({'error': 'api_id и api_hash обязательны'}), 400
+
+    try:
+        api_id_int = int(api_id)
+    except ValueError:
+        return jsonify({'error': 'API ID должен быть числом'}), 400
+
+    async def _start():
+        client = TelegramClient(StringSession(), api_id_int, api_hash,
+            device_model='LunaGifts Web', system_version='1.0', app_version='1.0')
+        await client.connect()
+        result = await client(ExportLoginTokenRequest(
+            api_id=api_id_int, api_hash=api_hash, except_ids=[]
+        ))
+        if isinstance(result, LoginToken):
+            token_b64 = base64.urlsafe_b64encode(result.token).decode()
+            temp_session = client.session.save()
+            await client.disconnect()
+            return {
+                'success': True,
+                'token': token_b64,
+                'expires': result.expires.timestamp(),
+                'temp_session': temp_session,
+            }
+        await client.disconnect()
+        return {'error': f'Unexpected result: {type(result).__name__}'}
+
+    try:
+        result = _run_async(_start())
+        if result.get('error'):
+            return jsonify({'error': result['error']}), 400
+
+        # Save temp session for checking later
+        data = _load_session()
+        data['qr_temp_session'] = result['temp_session']
+        data['api_id'] = api_id
+        data['api_hash'] = api_hash
+        _save_session(data)
+
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f'qr-login/start error: {e}')
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/qr-login/check', methods=['POST'])
+def qr_login_check():
+    """Check if QR was scanned, return new token if expired."""
+    if not _check_secret():
+        return jsonify({'error': 'Unauthorized'}), 403
+
+    data = _load_session()
+    temp_session = data.get('qr_temp_session', '')
+    api_id = int(data.get('api_id', 0))
+    api_hash = data.get('api_hash', '')
+
+    if not temp_session or not api_id:
+        return jsonify({'error': 'Сначала запустите QR вход'}), 400
+
+    async def _check():
+        client = TelegramClient(StringSession(temp_session), api_id, api_hash,
+            device_model='LunaGifts Web', system_version='1.0', app_version='1.0')
+        await client.connect()
+        try:
+            result = await client(ExportLoginTokenRequest(
+                api_id=api_id, api_hash=api_hash, except_ids=[]
+            ))
+            if isinstance(result, LoginTokenSuccess):
+                if await client.is_user_authorized():
+                    me = await client.get_me()
+                    sess = client.session.save()
+                    await client.disconnect()
+                    name = (me.first_name or '') + (' ' + me.last_name if me.last_name else '')
+                    return {'success': True, 'session': sess,
+                            'name': name.strip(), 'user_id': me.id,
+                            'username': me.username or '', 'phone': me.phone or ''}
+                await client.disconnect()
+                return {'error': 'Авторизация не завершена'}
+            elif isinstance(result, LoginTokenMigrateTo):
+                await client._switch_dc(result.dc_id)
+                result2 = await client(ImportLoginTokenRequest(result.token))
+                if isinstance(result2, LoginTokenSuccess):
+                    if await client.is_user_authorized():
+                        me = await client.get_me()
+                        sess = client.session.save()
+                        await client.disconnect()
+                        name = (me.first_name or '') + (' ' + me.last_name if me.last_name else '')
+                        return {'success': True, 'session': sess,
+                                'name': name.strip(), 'user_id': me.id,
+                                'username': me.username or '', 'phone': me.phone or ''}
+                await client.disconnect()
+                return {'error': 'Миграция DC не удалась'}
+            elif isinstance(result, LoginToken):
+                # Not scanned yet, return fresh token
+                token_b64 = base64.urlsafe_b64encode(result.token).decode()
+                updated = client.session.save()
+                await client.disconnect()
+                return {'waiting': True, 'token': token_b64, 'temp_session': updated}
+            await client.disconnect()
+            return {'waiting': True}
+        except tl_errors.SessionPasswordNeededError:
+            updated = client.session.save()
+            await client.disconnect()
+            return {'need_2fa': True, 'temp_session': updated}
+        except Exception as e:
+            try:
+                await client.disconnect()
+            except:
+                pass
+            return {'error': str(e)}
+
+    try:
+        result = _run_async(_check())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+    if result.get('error'):
+        return jsonify({'error': result['error']}), 400
+
+    # Update temp session if changed
+    if result.get('temp_session'):
+        data = _load_session()
+        data['qr_temp_session'] = result['temp_session']
+        _save_session(data)
+
+    if result.get('need_2fa'):
+        return jsonify({'need_2fa': True})
+
+    if result.get('success'):
+        # Save the real session
+        data = _load_session()
+        data['session'] = result['session']
+        data['phone'] = result.get('phone', '')
+        data.pop('qr_temp_session', None)
+        _save_session(data)
+        return jsonify({
+            'success': True,
+            'account_name': result['name'],
+            'account_id': result['user_id'],
+            'username': result['username'],
+        })
+
+    # Still waiting
+    return jsonify({'waiting': True, 'token': result.get('token', '')})
+
+
+@app.route('/qr-login/2fa', methods=['POST'])
+def qr_login_2fa():
+    """Complete QR login with 2FA password."""
+    if not _check_secret():
+        return jsonify({'error': 'Unauthorized'}), 403
+
+    body = request.json or {}
+    password = str(body.get('password', '')).strip()
+    if not password:
+        return jsonify({'error': 'Введите пароль'}), 400
+
+    data = _load_session()
+    temp_session = data.get('qr_temp_session', '')
+    api_id = int(data.get('api_id', 0))
+    api_hash = data.get('api_hash', '')
+
+    if not temp_session:
+        return jsonify({'error': 'Нет активной QR сессии'}), 400
+
+    async def _2fa():
+        client = TelegramClient(StringSession(temp_session), api_id, api_hash)
+        await client.connect()
+        try:
+            await client.sign_in(password=password)
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                sess = client.session.save()
+                await client.disconnect()
+                name = (me.first_name or '') + (' ' + me.last_name if me.last_name else '')
+                return {'success': True, 'session': sess,
+                        'name': name.strip(), 'user_id': me.id,
+                        'username': me.username or '', 'phone': me.phone or ''}
+            await client.disconnect()
+            return {'error': 'Авторизация не завершена'}
+        except tl_errors.PasswordHashInvalidError:
+            await client.disconnect()
+            return {'error': 'Неверный пароль'}
+        except Exception as e:
+            try:
+                await client.disconnect()
+            except:
+                pass
+            return {'error': str(e)}
+
+    try:
+        result = _run_async(_2fa())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+    if result.get('error'):
+        return jsonify({'error': result['error']}), 400
+
+    if result.get('success'):
+        data = _load_session()
+        data['session'] = result['session']
+        data['phone'] = result.get('phone', '')
+        data.pop('qr_temp_session', None)
         _save_session(data)
         return jsonify({
             'success': True,
