@@ -801,6 +801,16 @@ def send_gift():
             invoice = tl_types.InputInvoiceStarGift(
                 peer=target,
                 gift_id=int(gift_id),
+                message=tl_types.TextWithEntities(
+                    text='\u2b50 Gift from @lunagifts_robot\nPromocode from 3 stars \u201cLunaVPN\u201d',
+                    entities=[
+                        tl_types.MessageEntityCustomEmoji(
+                            offset=0,
+                            length=1,
+                            document_id=5456140674028019486
+                        )
+                    ]
+                ),
             )
 
             form = await client(tl_functions.payments.GetPaymentFormRequest(
