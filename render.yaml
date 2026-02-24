@@ -12,5 +12,7 @@ services:
     envVars:
       - key: RELAY_SECRET
         generateValue: true
+      - key: PA_URL
+        value: "https://lunagifts.pythonanywhere.com"
       - key: PYTHON_VERSION
         value: "3.12.0"
