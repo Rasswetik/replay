@@ -9,6 +9,10 @@ import json
 import asyncio
 import logging
 import base64
+import threading
+import time
+import urllib.request
+import urllib.error
 from flask import Flask, request, jsonify
 
 # ---------- Telethon ----------
@@ -24,12 +28,18 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 # Secret key for authenticating requests from PA app
 RELAY_SECRET = os.environ.get('RELAY_SECRET', 'change-me-in-production')
 
-# Persistent session data file
+# PythonAnywhere URL for session backup (survives Render restarts)
+PA_URL = os.environ.get('PA_URL', 'https://lunagifts.pythonanywhere.com')
+
+# Persistent session data file (local, may be wiped on Render restart)
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
 SESSION_FILE = os.path.join(DATA_DIR, 'session.json')
 
 # Temp auth state (in-memory, per-process)
 _auth_state = {}
+
+# Flag: have we tried restoring from PA backup this process?
+_pa_restore_attempted = False
 
 
 def _check_secret():
@@ -40,25 +50,109 @@ def _check_secret():
     return True
 
 
+# ---------- PA session backup (persistent across Render restarts) ----------
+
+def _push_session_to_pa(data):
+    """Push session backup to PythonAnywhere for persistence."""
+    if not PA_URL or RELAY_SECRET == 'change-me-in-production':
+        return
+    try:
+        payload = json.dumps({
+            'relay_secret': RELAY_SECRET,
+            'action': 'save',
+            'session_data': data,
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            PA_URL.rstrip('/') + '/api/relay-session-backup',
+            data=payload,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        resp = urllib.request.urlopen(req, timeout=15)
+        logging.info(f"Session pushed to PA backup: {resp.status}")
+    except Exception as e:
+        logging.warning(f"Failed to push session to PA: {e}")
+
+
+def _pull_session_from_pa():
+    """Pull session backup from PythonAnywhere."""
+    if not PA_URL or RELAY_SECRET == 'change-me-in-production':
+        return None
+    try:
+        payload = json.dumps({
+            'relay_secret': RELAY_SECRET,
+            'action': 'get',
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            PA_URL.rstrip('/') + '/api/relay-session-backup',
+            data=payload,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        resp = urllib.request.urlopen(req, timeout=15)
+        body = json.loads(resp.read().decode('utf-8'))
+        sd = body.get('session_data')
+        if sd and isinstance(sd, dict) and sd.get('session'):
+            logging.info("Session restored from PA backup!")
+            return sd
+    except Exception as e:
+        logging.warning(f"Failed to pull session from PA: {e}")
+    return None
+
+
+# ---------- Local session load / save ----------
+
 def _load_session():
-    """Load saved session data from file."""
+    """Load saved session data from file, falling back to PA backup."""
+    global _pa_restore_attempted
+
+    # 1. Try local file
+    try:
+        if os.path.exists(SESSION_FILE):
+            with open(SESSION_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if data.get('session'):
+                    return data
+    except Exception:
+        pass
+
+    # 2. Fallback: restore from PA backup (once per process)
+    if not _pa_restore_attempted:
+        _pa_restore_attempted = True
+        pa_data = _pull_session_from_pa()
+        if pa_data:
+            # Save locally for further reads this process
+            try:
+                os.makedirs(DATA_DIR, exist_ok=True)
+                with open(SESSION_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(pa_data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+            return pa_data
+
+    # 3. Maybe local file has partial data (api_id/etc but no session)
     try:
         if os.path.exists(SESSION_FILE):
             with open(SESSION_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
     except Exception:
         pass
+
     return {}
 
 
 def _save_session(data):
-    """Save session data to file."""
+    """Save session data to local file AND push backup to PA."""
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(SESSION_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logging.error(f"save_session error: {e}")
+
+    # Async push to PA in background thread (don't block the request)
+    if data.get('session'):
+        threading.Thread(target=_push_session_to_pa, args=(data,), daemon=True).start()
 
 
 def _run_async(coro):
@@ -102,11 +196,53 @@ def _code_type_name(sent_type):
     return mapping.get(name, name)
 
 
+# ---------- Keep-alive (prevents Render free tier spin-down) ----------
+
+_start_time = time.time()
+_keepalive_started = False
+
+def _keepalive_worker():
+    """Background thread: ping own public URL every 10 min to prevent Render spin-down."""
+    ext_url = os.environ.get('RENDER_EXTERNAL_URL', '')
+    if not ext_url:
+        logging.info("RENDER_EXTERNAL_URL not set, keep-alive disabled")
+        return
+    logging.info(f"Keep-alive thread started, pinging {ext_url}/health every 10 min")
+    while True:
+        time.sleep(600)  # 10 minutes
+        try:
+            req = urllib.request.Request(ext_url + '/health', method='GET')
+            urllib.request.urlopen(req, timeout=15)
+            logging.debug("Keep-alive ping OK")
+        except Exception as e:
+            logging.debug(f"Keep-alive ping failed: {e}")
+
+
+def _start_keepalive():
+    global _keepalive_started
+    if _keepalive_started:
+        return
+    _keepalive_started = True
+    t = threading.Thread(target=_keepalive_worker, daemon=True)
+    t.start()
+
+
+# Start keep-alive when loaded by gunicorn
+_start_keepalive()
+
+
 # ---------- API Endpoints ----------
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok', 'service': 'telethon-relay'})
+    uptime = int(time.time() - _start_time)
+    has_session = bool(_load_session().get('session'))
+    return jsonify({
+        'status': 'ok',
+        'service': 'telethon-relay',
+        'uptime_seconds': uptime,
+        'session_present': has_session,
+    })
 
 
 @app.route('/status', methods=['POST'])
@@ -847,5 +983,6 @@ def send_gift():
 
 
 if __name__ == '__main__':
+    _start_keepalive()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
